@@ -39,6 +39,14 @@ tar -xzf sam31_cgh_p2_24tiles_20260605.tar.gz
 cd sam31_cgh_p2_24tiles_20260605
 ```
 
+If you already extracted an earlier package before the config helper scripts
+were added, run this after `git pull`:
+
+```bash
+cp ../write_sam3_config.py .
+cp ../patch_sam3_cluster.py .
+```
+
 If SSH is not configured on the cluster, use HTTPS instead:
 
 ```bash
@@ -46,6 +54,7 @@ git clone https://github.com/nttssv/sam31-cgh-strategy2.git
 ```
 
 For a private repo, HTTPS cloning requires GitHub authentication or a token.
+The repo is currently public to make cluster cloning easier.
 
 ## Install Dependencies
 
