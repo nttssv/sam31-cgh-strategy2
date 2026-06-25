@@ -170,6 +170,18 @@ outputs/strategy2_41tiles_full_unfreeze_YYYYMMDD_HHMMSS/
 The notebook streams SAM3 logs, parses training loss and segmentation metrics,
 writes `strategy2_live_metrics.jsonl`, and draws live plots.
 
+After training, run the notebook's qualitative comparison cell to save
+`original / ground truth / SAM3 prediction` panels under the run folder. The
+defaults compare the four test tiles with prompts for clear and compact cell
+boundaries:
+
+```bash
+export SAM31_COMPARE_LIMIT=4
+export SAM31_COMPARE_PROMPTS="clear cell boundary,compact cell boundary"
+export SAM31_COMPARE_GT_CATEGORIES="clear_cell_boundary,compact_cell_boundary"
+export SAM31_COMPARE_SCORE_THRESH=0.30
+```
+
 ## Legacy 24-Tile Package
 
 The old tarball `sam31_cgh_p2_24tiles_20260605.tar.gz` is retained for
