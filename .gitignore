@@ -6,4 +6,5 @@ __pycache__/
 .ipynb_checkpoints/
 sam3/
 outputs/
+dataset/
 sam31_cgh_p2_24tiles_20260605/

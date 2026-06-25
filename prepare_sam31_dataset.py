@@ -34,9 +34,18 @@ CELL_MASK_DIR = DATASET_ROOT / "cell_instance_masks"
 AUX_MASK_DIR = DATASET_ROOT / "auxiliary_masks"
 METADATA_DIR = DATASET_ROOT / "metadata"
 COCO_ROOT = DATASET_ROOT / "coco_sam3" / "cgh_pathology_sam31"
+DEFAULT_FULL41_SOURCE_ROOT = (
+    Path.home() / "Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full"
+)
 
 INCLUDE_UNCERTAIN_IN_COCO = os.getenv("INCLUDE_UNCERTAIN_IN_COCO", "0") == "1"
 MIN_COMPONENT_AREA_PX = int(os.getenv("MIN_COMPONENT_AREA_PX", "10"))
+DEFAULT_VAL_TILE_IDS = "p2_tile_05,p2_tile_10,p2_tile_15,p2_tile_20"
+VAL_TILE_IDS = {
+    token.strip()
+    for token in os.getenv("SAM31_VAL_TILE_IDS", DEFAULT_VAL_TILE_IDS).split(",")
+    if token.strip()
+}
 
 CATEGORIES = [
     {
@@ -87,6 +96,114 @@ def is_real_png(path: Path) -> bool:
     return path.suffix.lower() == ".png" and not path.name.startswith("._")
 
 
+def clean_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def copy_files(src: Path, dst: Path, suffixes: Tuple[str, ...] = (".png",)) -> int:
+    if not src.exists():
+        return 0
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for path in sorted(src.iterdir()):
+        if path.name.startswith("._") or path.name == ".DS_Store":
+            continue
+        if path.is_file() and path.suffix.lower() in suffixes:
+            shutil.copy2(path, dst / path.name)
+            copied += 1
+    return copied
+
+
+def resolve_source_root() -> Optional[Path]:
+    for env_name in ("CGH_SAM31_SOURCE_ROOT", "CGH_DATASET_ROOT"):
+        raw = os.getenv(env_name, "").strip()
+        if raw:
+            path = Path(raw).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"{env_name} points to a missing path: {path}")
+            return path
+    if DEFAULT_FULL41_SOURCE_ROOT.exists():
+        return DEFAULT_FULL41_SOURCE_ROOT.resolve()
+    return None
+
+
+def resolve_source_image_mask_dirs(source_root: Path) -> Tuple[Path, Path]:
+    candidates = [
+        (source_root / "train" / "images", source_root / "train" / "masks"),
+        (source_root / "images", source_root / "masks"),
+    ]
+    for image_dir, mask_dir in candidates:
+        if image_dir.exists() and mask_dir.exists():
+            return image_dir, mask_dir
+    raise FileNotFoundError(
+        "Could not locate image/mask folders under source root. Expected "
+        f"train/images + train/masks or images + masks under: {source_root}"
+    )
+
+
+def stage_dataset_from_source(source_root: Path) -> Dict[str, object]:
+    """Copy the full CellSeg1 export into the legacy Strategy2 dataset layout."""
+    image_src, mask_src = resolve_source_image_mask_dirs(source_root)
+    image_files = sorted(p for p in image_src.glob("*.png") if is_real_png(p))
+    mask_files = sorted(p for p in mask_src.glob("*.png") if is_real_png(p))
+    if not image_files or not mask_files:
+        raise FileNotFoundError(f"No PNG image/mask pairs found in {image_src} and {mask_src}")
+    if len(image_files) != len(mask_files):
+        raise RuntimeError(f"Image/mask count mismatch: {len(image_files)} images, {len(mask_files)} masks")
+    if [p.stem for p in image_files] != [p.stem for p in mask_files]:
+        raise RuntimeError("Image/mask stems do not match in the source dataset")
+
+    DATASET_ROOT.mkdir(parents=True, exist_ok=True)
+    for path in [
+        IMAGE_DIR,
+        CELL_MASK_DIR,
+        AUX_MASK_DIR,
+        METADATA_DIR,
+        DATASET_ROOT / "semantic_masks",
+        DATASET_ROOT / "previews",
+        COCO_ROOT,
+    ]:
+        clean_dir(path)
+
+    copied_images = copy_files(image_src, IMAGE_DIR, suffixes=(".png",))
+    copied_masks = copy_files(mask_src, CELL_MASK_DIR, suffixes=(".png",))
+    copied_aux = copy_files(source_root / "auxiliary_masks", AUX_MASK_DIR, suffixes=(".png",))
+    copied_semantic = copy_files(source_root / "semantic_masks", DATASET_ROOT / "semantic_masks", suffixes=(".png",))
+    copied_previews = copy_files(source_root / "previews", DATASET_ROOT / "previews", suffixes=(".png", ".jpg", ".jpeg"))
+
+    metadata_names = [
+        "dataset_manifest.csv",
+        "cell_instances.csv",
+        "boundary_qc.csv",
+        "batch_membership.csv",
+        "conversion_summary.json",
+        "README.md",
+    ]
+    copied_metadata = 0
+    for name in metadata_names:
+        src = source_root / name
+        if src.exists() and src.is_file():
+            shutil.copy2(src, METADATA_DIR / src.name)
+            copied_metadata += 1
+
+    summary = {
+        "source_root": str(source_root),
+        "source_image_dir": str(image_src),
+        "source_mask_dir": str(mask_src),
+        "copied_images": copied_images,
+        "copied_cell_masks": copied_masks,
+        "copied_auxiliary_masks": copied_aux,
+        "copied_semantic_masks": copied_semantic,
+        "copied_previews": copied_previews,
+        "copied_metadata_files": copied_metadata,
+        "val_tile_ids": sorted(VAL_TILE_IDS),
+    }
+    (DATASET_ROOT / "staged_source_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
 def load_yolo_split() -> Dict[str, str]:
     """Return tile id -> split using the existing YOLO split if available."""
     split_by_tile: Dict[str, str] = {}
@@ -98,6 +215,10 @@ def load_yolo_split() -> Dict[str, str]:
         for path in sorted(p for p in split_dir.glob("*.png") if is_real_png(p)):
             split_by_tile[path.stem] = "test" if split_name == "val" else "train"
     return split_by_tile
+
+
+def default_split(tile_id: str) -> str:
+    return "test" if tile_id in VAL_TILE_IDS else "train"
 
 
 def load_cell_class_map() -> Dict[Tuple[str, int], str]:
@@ -234,6 +355,19 @@ def manifest_row(
 
 
 def build() -> None:
+    source_root = resolve_source_root()
+    staged_summary: Dict[str, object] = {}
+    if source_root is not None:
+        staged_summary = stage_dataset_from_source(source_root)
+    elif not IMAGE_DIR.exists() or not CELL_MASK_DIR.exists():
+        raise FileNotFoundError(
+            "No staged dataset found. Set CGH_SAM31_SOURCE_ROOT or CGH_DATASET_ROOT "
+            "to the full CellSeg1 dataset folder, for example "
+            "~/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full."
+        )
+    else:
+        clean_dir(COCO_ROOT)
+
     split_by_tile = load_yolo_split()
     cell_class_map = load_cell_class_map()
 
@@ -245,7 +379,7 @@ def build() -> None:
 
     for image_path in sorted(p for p in IMAGE_DIR.glob("*.png") if is_real_png(p)):
         tile_id = image_path.stem
-        split = split_by_tile.get(tile_id, "train")
+        split = split_by_tile.get(tile_id, default_split(tile_id))
         width, height = image_size(image_path)
         file_name = copy_image_to_split(image_path, split)
         image_id = next_image_id
@@ -411,6 +545,8 @@ def build() -> None:
         "manifest_rows": len(manifest_rows),
         "categories": [c["name"] for c in categories_for_coco],
         "include_uncertain_in_coco": INCLUDE_UNCERTAIN_IN_COCO,
+        "val_tile_ids": sorted(VAL_TILE_IDS),
+        "staged_source": staged_summary,
     }
     with (DATASET_ROOT / "sam31_dataset_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)

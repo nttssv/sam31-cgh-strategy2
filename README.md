@@ -1,30 +1,62 @@
 # SAM31 CGH Strategy 2 Training Package
 
-This repo contains the Strategy 2 SAM3/SAM31 training package for the CGH pathology tiles.
+This repo contains the Strategy 2 SAM3/SAM31 training package for CGH adrenal
+pathology tiles. It has been retargeted from the old 24-tile package to the
+current full 41-tile CellSeg1 dataset.
 
-## What Changed From Strategy 1
+## Current Dataset
 
-- Dataset increased from 20 to 24 canonical training tiles.
-- The 4 new tiles are `yolo_tile_21` through `yolo_tile_24`.
-- Duplicate/helper QuPath training tiles such as `cell_boundary_clean` and `nuclei_clean` were excluded.
-- Export logic uses centroid-in-tile over the full QuPath hierarchy, so nested annotations are included.
-- Validation/test split remains comparable: `p2_tile_05`, `p2_tile_10`, `p2_tile_15`, and `p2_tile_20`.
-- Training notebook defaults to full unfreeze with `SAM3_CGH_FREEZE_BACKBONES=0`.
-- Training output goes into a new timestamped `outputs/strategy2_*` folder and does not overwrite old runs.
-- Live plots are shown inside `strategy2.ipynb`.
+The expected source dataset is cloned separately from:
 
-## Dataset Summary
+```bash
+git clone --branch codex/add-second-batch-training-data --single-branch \
+  https://github.com/nttssv/training_pa_he_annotation.git \
+  ~/Desktop/1.Data/training_pa_he_annotation_full
+```
 
-After extracting the tarball and running `prepare_sam31_dataset.py`:
+Use this folder as the SAM3 source:
 
-```json
-{
-  "images": 24,
-  "train_images": 20,
-  "test_images": 4,
-  "annotations": 1343,
-  "manifest_rows": 1571
-}
+```text
+~/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full
+```
+
+Expected source layout:
+
+```text
+cellseg1_cgh_p2_combined_41_full/
+  train/images/*.png   # 41 images
+  train/masks/*.png    # 41 instance masks
+  auxiliary_masks/
+  semantic_masks/
+  previews/
+  dataset_manifest.csv
+  cell_instances.csv
+  boundary_qc.csv
+```
+
+`prepare_sam31_dataset.py` stages this source into the legacy Strategy2 package
+layout under `dataset/`, then regenerates COCO JSON for SAM3:
+
+```text
+dataset/images/
+dataset/cell_instance_masks/
+dataset/auxiliary_masks/
+dataset/metadata/
+dataset/coco_sam3/cgh_pathology_sam31/train/_annotations.coco.json
+dataset/coco_sam3/cgh_pathology_sam31/test/_annotations.coco.json
+```
+
+Default split:
+
+```text
+train: 37 images
+test:  p2_tile_05, p2_tile_10, p2_tile_15, p2_tile_20
+```
+
+Override the validation/test tiles with:
+
+```bash
+export SAM31_VAL_TILE_IDS="p2_tile_05,p2_tile_10,p2_tile_15,p2_tile_20"
 ```
 
 ## Clone On GPU Cluster
@@ -33,40 +65,40 @@ After extracting the tarball and running `prepare_sam31_dataset.py`:
 cd ~/Desktop
 git clone git@github.com:nttssv/sam31-cgh-strategy2.git
 cd sam31-cgh-strategy2
-
-shasum -a 256 -c SHA256SUMS
-tar -xzf sam31_cgh_p2_24tiles_20260605.tar.gz
-cd sam31_cgh_p2_24tiles_20260605
 ```
 
-If you already extracted an earlier package before the config helper scripts
-were added, run this after `git pull`:
-
-```bash
-cp ../write_sam3_config.py .
-cp ../patch_sam3_cluster.py .
-```
-
-If SSH is not configured on the cluster, use HTTPS instead:
+If SSH is not configured:
 
 ```bash
 git clone https://github.com/nttssv/sam31-cgh-strategy2.git
 ```
 
-For a private repo, HTTPS cloning requires GitHub authentication or a token.
-The repo is currently public to make cluster cloning easier.
+Clone/update the 41-tile data:
+
+```bash
+mkdir -p ~/Desktop/1.Data
+cd ~/Desktop/1.Data
+git clone --branch codex/add-second-batch-training-data --single-branch \
+  https://github.com/nttssv/training_pa_he_annotation.git \
+  training_pa_he_annotation_full
+
+find ~/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full/train/images -type f | wc -l
+find ~/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full/train/masks -type f | wc -l
+```
+
+Both counts should be `41`.
 
 ## Install Dependencies
 
 Install the PyTorch wheel for the assigned GPU first.
 
-Blackwell / CUDA 12.8:
+CUDA 12.8:
 
 ```bash
 python -m pip install --user --force-reinstall torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-V100 / CUDA 11.8:
+CUDA 11.8:
 
 ```bash
 python -m pip install --user --force-reinstall torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu118
@@ -75,25 +107,53 @@ python -m pip install --user --force-reinstall torch==2.7.0 torchvision==0.22.0 
 Then install helper dependencies:
 
 ```bash
+cd ~/Desktop/sam31-cgh-strategy2
 python -m pip install --user -r requirements_sam31.txt
+```
+
+SAM3 itself is expected at `../sam3` by default, or set:
+
+```bash
+export SAM3_REPO=/path/to/facebookresearch/sam3
+```
+
+You also need Hugging Face access to `facebook/sam3`:
+
+```bash
+hf auth login
+```
+
+## Prepare Dataset
+
+```bash
+cd ~/Desktop/sam31-cgh-strategy2
+export CGH_SAM31_SOURCE_ROOT="$HOME/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full"
+python prepare_sam31_dataset.py
+```
+
+Expected summary:
+
+```json
+{
+  "images": 41,
+  "train_images": 37,
+  "test_images": 4
+}
 ```
 
 ## Run Notebook
 
-Start Jupyter from the extracted folder:
-
 ```bash
-cd ~/Desktop/sam31-cgh-strategy2/sam31_cgh_p2_24tiles_20260605
-jupyter lab
+cd ~/Desktop/sam31-cgh-strategy2
+export CGH_SAM31_SOURCE_ROOT="$HOME/Desktop/1.Data/training_pa_he_annotation_full/cellseg1_cgh_p2_combined_41_full"
+jupyter lab strategy2.ipynb
 ```
-
-Open `strategy2.ipynb`.
 
 Before training, make sure:
 
-- `SAM3_REPO` points to the local SAM3 checkout, or SAM3 is cloned at `../sam3`.
-- Hugging Face access to `facebook/sam3` is configured with `hf auth login`.
-- No previous training process is already using the GPU.
+- `SAM3_REPO` points to a working SAM3 checkout.
+- Hugging Face access to `facebook/sam3` is configured.
+- No previous `sam3/train/train.py` process is already using the GPU.
 
 In the training cell, set:
 
@@ -101,10 +161,19 @@ In the training cell, set:
 RUN_TRAINING = True
 ```
 
-The notebook writes outputs to:
+Outputs are written to:
 
 ```text
-outputs/strategy2_24tiles_full_unfreeze_YYYYMMDD_HHMMSS/
+outputs/strategy2_41tiles_full_unfreeze_YYYYMMDD_HHMMSS/
 ```
 
-Old Strategy 1 outputs are not touched.
+The notebook streams SAM3 logs, parses training loss and segmentation metrics,
+writes `strategy2_live_metrics.jsonl`, and draws live plots.
+
+## Legacy 24-Tile Package
+
+The old tarball `sam31_cgh_p2_24tiles_20260605.tar.gz` is retained for
+reproducibility. The current notebook and prepare script default to the full
+41-tile source dataset when `CGH_SAM31_SOURCE_ROOT` or `CGH_DATASET_ROOT` is
+set, or when the default `~/Desktop/1.Data/.../cellseg1_cgh_p2_combined_41_full`
+folder exists.
