@@ -189,3 +189,59 @@ reproducibility. The current notebook and prepare script default to the full
 41-tile source dataset when `CGH_SAM31_SOURCE_ROOT` or `CGH_DATASET_ROOT` is
 set, or when the default `~/Desktop/1.Data/.../cellseg1_cgh_p2_combined_41_full`
 folder exists.
+
+## Trial Run 3: Hybrid YOLO + SAM3 + CellSeg1
+
+Trial run 3 measures a selected-tile hybrid inference pass:
+
+- YOLO predicts nuclei.
+- SAM3 predicts clear-cell boundary candidates.
+- CellSeg1 predicts residual compact candidates.
+- YOLO nuclei gate both SAM3 and CellSeg1 candidates.
+
+Clone this exact branch on the GPU cluster:
+
+```bash
+cd ~/Desktop
+git clone --branch codex/train-sam31-full41 --single-branch \
+  https://github.com/nttssv/sam31-cgh-strategy2.git
+cd sam31-cgh-strategy2
+```
+
+If the repo already exists:
+
+```bash
+cd ~/Desktop/sam31-cgh-strategy2
+git switch codex/train-sam31-full41
+git pull --ff-only origin codex/train-sam31-full41
+```
+
+Run the selected compact-tile trial:
+
+```bash
+export SAM3_REPO="$HOME/Desktop/sam31-cgh-training-data/sam3"
+export SAM31_OUTPUT_ROOT="$HOME/Desktop/sam31-cgh-strategy2/outputs/strategy2_41tiles_full_unfreeze_20260625_160623"
+export YOLO_MODEL_PATH="$HOME/Desktop/sam31-cgh-training-data/training_data/reference_models/cellseg1_cgh_p2_yolo_best.pt"
+export CELLSEG1_REPO="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_repo"
+export CELLSEG1_RUN_DIR="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_cgh_p2_41full_20260625_124306"
+export TRIAL3_TILE_KEYS="train_human_compact_tile_001,train_human_compact_tile_002,train_human_compact_tile_003,train_human_compact_tile_004"
+
+python trial_run_3_hybrid_inference.py
+```
+
+Outputs are written under:
+
+```text
+outputs/strategy2_41tiles_full_unfreeze_20260625_160623/trial_run_3_hybrid_selected_tiles/
+```
+
+Key files:
+
+```text
+trial_run_3_metrics.csv
+trial_run_3_summary.csv
+trial_run_3_source_instances.csv
+trial_run_3_final_instances.csv
+comparison_images/*_trial3_compare.png
+pred_masks/*_hybrid_instance_mask.png
+```
