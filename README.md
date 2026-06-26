@@ -197,7 +197,8 @@ Trial run 3 measures a selected-tile hybrid inference pass:
 - YOLO predicts nuclei.
 - SAM3 predicts clear-cell boundary candidates.
 - CellSeg1 predicts residual compact candidates.
-- YOLO nuclei gate both SAM3 and CellSeg1 candidates.
+- YOLO nuclei gate only CellSeg1 compact candidates. SAM3 clear-cell
+  candidates are kept by score, area, and duplicate/NMS filtering.
 
 Clone this exact branch on the GPU cluster:
 
@@ -225,6 +226,8 @@ export YOLO_MODEL_PATH="$HOME/Desktop/sam31-cgh-training-data/training_data/refe
 export CELLSEG1_REPO="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_repo"
 export CELLSEG1_RUN_DIR="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_cgh_p2_41full_20260625_124306"
 export TRIAL3_TILE_KEYS="train_human_compact_tile_001,train_human_compact_tile_002,train_human_compact_tile_003,train_human_compact_tile_004"
+export TRIAL3_CELLSEG1_NUCLEUS_DILATION_PX=8
+export TRIAL3_SAM31_NMS_IOU_THRESH=0.80
 
 python trial_run_3_hybrid_inference.py
 ```

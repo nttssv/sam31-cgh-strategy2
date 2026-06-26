@@ -6,7 +6,8 @@ Pipeline:
 - SAM3.1 predicts clear-cell boundary candidates.
 - CellSeg1 predicts dense cell-boundary candidates, used as residual compact
   candidates after removing overlap with SAM3 clear candidates.
-- YOLO nuclei gate both SAM3 and CellSeg1 candidates.
+- YOLO nuclei gate only CellSeg1 compact candidates. SAM3.1 clear candidates
+  are kept by score, area, and duplicate/NMS filtering.
 
 This script is intentionally path-defaulted for the SUTD GPU cluster layout used
 in this project, while every important path can still be overridden with env vars.
@@ -105,20 +106,21 @@ SAM31_CLEAR_PROMPTS = [
 ]
 SAM31_SCORE_THRESH = float(os.getenv("TRIAL3_SAM31_SCORE_THRESH", "0.30"))
 SAM31_MIN_AREA = int(os.getenv("TRIAL3_SAM31_MIN_AREA", "80"))
+SAM31_NMS_IOU_THRESH = float(os.getenv("TRIAL3_SAM31_NMS_IOU_THRESH", "0.80"))
 
 CELLSEG1_IOU_THRESH = float(os.getenv("TRIAL3_CELLSEG1_IOU_THRESH", "0.80"))
 CELLSEG1_STABILITY_THRESH = float(os.getenv("TRIAL3_CELLSEG1_STABILITY_THRESH", "0.60"))
 CELLSEG1_MIN_AREA = int(os.getenv("TRIAL3_CELLSEG1_MIN_AREA", "80"))
 CELLSEG1_MAX_AREA = int(os.getenv("TRIAL3_CELLSEG1_MAX_AREA", "8000"))
 MAX_OVERLAP_WITH_SAM_CLEAR = float(os.getenv("TRIAL3_MAX_OVERLAP_WITH_SAM_CLEAR", "0.20"))
+CELLSEG1_NUCLEUS_DILATION_PX = int(os.getenv("TRIAL3_CELLSEG1_NUCLEUS_DILATION_PX", "8"))
 
 YOLO_NUCLEUS_CLASS_ID = int(os.getenv("TRIAL3_YOLO_NUCLEUS_CLASS_ID", "0"))
 YOLO_CONF = float(os.getenv("TRIAL3_YOLO_CONF", "0.25"))
 YOLO_IOU = float(os.getenv("TRIAL3_YOLO_IOU", "0.50"))
 YOLO_MIN_NUCLEUS_AREA = int(os.getenv("TRIAL3_YOLO_MIN_NUCLEUS_AREA", "10"))
 
-MIN_NUCLEUS_OVERLAP_PX = int(os.getenv("TRIAL3_MIN_NUCLEUS_OVERLAP_PX", "5"))
-USE_NUCLEUS_CENTROID_GATE = os.getenv("TRIAL3_USE_NUCLEUS_CENTROID_GATE", "1") != "0"
+CELLSEG1_NUCLEUS_OVERLAP_PX = int(os.getenv("TRIAL3_MIN_NUCLEUS_OVERLAP_PX", "5"))
 DISPLAY_IMAGES = os.getenv("TRIAL3_DISPLAY_IMAGES", "0") == "1"
 
 GT_COLOR = np.array([0, 180, 120], dtype=np.uint8)
@@ -283,22 +285,48 @@ def centroid_of_mask(mask_bool: np.ndarray) -> Tuple[int, int] | None:
     return int(np.mean(xs)), int(np.mean(ys))
 
 
-def cell_has_nucleus(cell_bool: np.ndarray, nucleus_mask: np.ndarray) -> Tuple[bool, int, str]:
+def dilate_binary_mask(mask_bool: np.ndarray, dilation_px: int) -> np.ndarray:
+    mask_bool = np.asarray(mask_bool, dtype=bool)
+    if dilation_px <= 0:
+        return mask_bool
+    kernel_size = 2 * dilation_px + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask_bool.astype(np.uint8), kernel, iterations=1).astype(bool)
+
+
+def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = np.asarray(mask_a, dtype=bool)
+    b = np.asarray(mask_b, dtype=bool)
+    intersection = int((a & b).sum())
+    union = int((a | b).sum())
+    return intersection / (union + 1e-8)
+
+
+def cell_has_nucleus(
+    cell_bool: np.ndarray,
+    nucleus_mask: np.ndarray,
+    dilation_px: int = CELLSEG1_NUCLEUS_DILATION_PX,
+) -> Tuple[bool, int, str]:
+    """Validate a CellSeg1 compact candidate using dilated YOLO nuclei geometry.
+
+    SAM3 clear-cell candidates intentionally do not call this function.
+    """
+    dilated_cell = dilate_binary_mask(cell_bool, dilation_px)
     nucleus_binary = nucleus_mask > 0
-    overlap_px = int((cell_bool & nucleus_binary).sum())
-    if overlap_px >= MIN_NUCLEUS_OVERLAP_PX:
+    overlap_px = int((dilated_cell & nucleus_binary).sum())
+
+    for nuc_label in sorted(int(v) for v in np.unique(nucleus_mask) if int(v) != 0):
+        centroid = centroid_of_mask(nucleus_mask == nuc_label)
+        if centroid is None:
+            continue
+        x, y = centroid
+        if 0 <= y < dilated_cell.shape[0] and 0 <= x < dilated_cell.shape[1] and dilated_cell[y, x]:
+            return True, overlap_px, "inside"
+
+    if overlap_px >= CELLSEG1_NUCLEUS_OVERLAP_PX:
         return True, overlap_px, "overlap"
 
-    if USE_NUCLEUS_CENTROID_GATE:
-        for nuc_label in sorted(int(v) for v in np.unique(nucleus_mask) if int(v) != 0):
-            nucleus = nucleus_mask == nuc_label
-            centroid = centroid_of_mask(nucleus)
-            if centroid is None:
-                continue
-            x, y = centroid
-            if 0 <= y < cell_bool.shape[0] and 0 <= x < cell_bool.shape[1] and cell_bool[y, x]:
-                return True, overlap_px, "centroid"
-    return False, overlap_px, "none"
+    return False, overlap_px, "rejected"
 
 
 def yolo_nucleus_mask(yolo_model: YOLO, image_path: Path, image_rgb: np.ndarray, tile_key: str = "") -> Tuple[np.ndarray, List[dict]]:
@@ -388,7 +416,12 @@ def scores_to_numpy(scores, n: int) -> np.ndarray:
     return arr[:n]
 
 
-def sam3_clear_mask(processor, pil_image: Image.Image, nucleus_mask: np.ndarray, tile_key: str = "") -> Tuple[np.ndarray, List[dict]]:
+def sam3_clear_mask(
+    processor,
+    pil_image: Image.Image,
+    image_rgb: np.ndarray,
+    tile_key: str = "",
+) -> Tuple[np.ndarray, List[dict]]:
     with torch.inference_mode(), sam31_autocast_context():
         state = processor.set_image(pil_image)
 
@@ -396,6 +429,7 @@ def sam3_clear_mask(processor, pil_image: Image.Image, nucleus_mask: np.ndarray,
     pred = np.zeros((height, width), dtype=np.uint16)
     rows = []
     next_label = 1
+    candidates = []
 
     for prompt in SAM31_CLEAR_PROMPTS:
         with torch.inference_mode(), sam31_autocast_context():
@@ -403,42 +437,69 @@ def sam3_clear_mask(processor, pil_image: Image.Image, nucleus_mask: np.ndarray,
 
         mask_stack = masks_to_numpy_stack(output.get("masks", []))
         scores = scores_to_numpy(output.get("scores"), len(mask_stack))
-        kept = 0
-        removed_no_nucleus = 0
 
         for idx, (raw_mask, score) in enumerate(zip(mask_stack, scores)):
             if float(score) < SAM31_SCORE_THRESH:
                 continue
             binary = raw_mask > 0
-            binary = resize_mask_to_image(binary.astype(np.uint8), np.asarray(pil_image)) > 0
-            pixels = binary & (pred == 0)
-            area = int(pixels.sum())
+            binary = resize_mask_to_image(binary.astype(np.uint8), image_rgb) > 0
+            area = int(binary.sum())
             if area < SAM31_MIN_AREA:
                 continue
-            has_nuc, nuc_overlap, gate_type = cell_has_nucleus(pixels, nucleus_mask)
-            if not has_nuc:
-                removed_no_nucleus += 1
-                continue
-            pred[pixels] = next_label
-            rows.append(
+            candidates.append(
                 {
-                    "source_model": "SAM3.1",
-                    "class_name": "clear_cell_boundary",
-                    "label": next_label,
+                    "mask": binary,
                     "prompt": prompt,
+                    "sam3_index": idx,
                     "score": float(score),
-                    "area_px": area,
-                    "nucleus_overlap_px": nuc_overlap,
-                    "nucleus_gate_type": gate_type,
+                    "raw_area_px": area,
                 }
             )
-            next_label += 1
-            kept += 1
 
         print(
             f"{tile_key} | SAM3.1 clear | prompt={prompt!r} raw={len(mask_stack)} "
-            f"kept={kept} removed_no_nucleus={removed_no_nucleus}"
+            f"after_score_area={sum(1 for row in candidates if row['prompt'] == prompt)}"
         )
+
+    kept_masks = []
+    removed_duplicate = 0
+    removed_consumed_overlap = 0
+
+    for candidate in sorted(candidates, key=lambda row: row["score"], reverse=True):
+        max_iou_with_kept = max((mask_iou(candidate["mask"], kept) for kept in kept_masks), default=0.0)
+        if 0.0 < SAM31_NMS_IOU_THRESH < 1.0 and max_iou_with_kept > SAM31_NMS_IOU_THRESH:
+            removed_duplicate += 1
+            continue
+
+        pixels = candidate["mask"] & (pred == 0)
+        area = int(pixels.sum())
+        if area < SAM31_MIN_AREA:
+            removed_consumed_overlap += 1
+            continue
+
+        pred[pixels] = next_label
+        kept_masks.append(candidate["mask"])
+        rows.append(
+            {
+                "source_model": "SAM3.1",
+                "class_name": "clear_cell_boundary",
+                "label": next_label,
+                "prompt": candidate["prompt"],
+                "score": candidate["score"],
+                "area_px": area,
+                "raw_area_px": candidate["raw_area_px"],
+                "sam3_index": candidate["sam3_index"],
+                "max_iou_with_kept": max_iou_with_kept,
+                "nucleus_overlap_px": np.nan,
+                "nucleus_gate_type": "not_applied",
+            }
+        )
+        next_label += 1
+
+    print(
+        f"{tile_key} | SAM3.1 clear final kept={int(pred.max())} "
+        f"removed_duplicate={removed_duplicate} removed_consumed_overlap={removed_consumed_overlap}"
+    )
     return pred, rows
 
 
@@ -462,7 +523,7 @@ def filter_cellseg_compact_candidates(
     rows = []
     next_label = 1
     sam_clear_binary = sam_clear_mask > 0
-    removed_no_nucleus = 0
+    removed_no_dilated_nucleus = 0
     removed_overlap_clear = 0
     removed_area = 0
 
@@ -477,9 +538,13 @@ def filter_cellseg_compact_candidates(
         if overlap_ratio > MAX_OVERLAP_WITH_SAM_CLEAR:
             removed_overlap_clear += 1
             continue
-        has_nuc, nuc_overlap, gate_type = cell_has_nucleus(candidate, nucleus_mask)
+        has_nuc, nuc_overlap, gate_type = cell_has_nucleus(
+            candidate,
+            nucleus_mask,
+            dilation_px=CELLSEG1_NUCLEUS_DILATION_PX,
+        )
         if not has_nuc:
-            removed_no_nucleus += 1
+            removed_no_dilated_nucleus += 1
             continue
         compact[candidate] = next_label
         rows.append(
@@ -499,7 +564,7 @@ def filter_cellseg_compact_candidates(
 
     print(
         f"CellSeg1 residual compact kept={int(compact.max())} "
-        f"removed_no_nucleus={removed_no_nucleus} "
+        f"removed_no_dilated_nucleus={removed_no_dilated_nucleus} "
         f"removed_overlap_clear={removed_overlap_clear} removed_area={removed_area}"
     )
     return compact, rows
@@ -658,7 +723,7 @@ def main() -> None:
         )
 
         nucleus_mask, nucleus_rows = yolo_nucleus_mask(yolo_model, image_path, original_rgb, tile_key=tile_key)
-        sam_clear, sam_rows = sam3_clear_mask(processor, pil_image, nucleus_mask, tile_key=tile_key)
+        sam_clear, sam_rows = sam3_clear_mask(processor, pil_image, original_rgb, tile_key=tile_key)
         _, cellseg_raw = cellseg1_predict_one(
             image_path, cellseg_config, read_image_to_numpy, resize_image, predict_images
         )
@@ -702,8 +767,11 @@ def main() -> None:
                     "hybrid_instances": int(hybrid_mask.max()),
                     "sam31_score_thresh": SAM31_SCORE_THRESH,
                     "sam31_min_area": SAM31_MIN_AREA,
+                    "sam31_nms_iou_thresh": SAM31_NMS_IOU_THRESH,
                     "cellseg1_min_area": CELLSEG1_MIN_AREA,
                     "cellseg1_max_area": CELLSEG1_MAX_AREA,
+                    "cellseg1_nucleus_dilation_px": CELLSEG1_NUCLEUS_DILATION_PX,
+                    "cellseg1_nucleus_overlap_px": CELLSEG1_NUCLEUS_OVERLAP_PX,
                     "max_overlap_with_sam_clear": MAX_OVERLAP_WITH_SAM_CLEAR,
                     "yolo_conf": YOLO_CONF,
                     "yolo_iou": YOLO_IOU,
@@ -721,7 +789,6 @@ def main() -> None:
         panels = [
             original_rgb,
             draw_instance_mask(original_rgb, gt_all, GT_COLOR),
-            draw_instance_mask(original_rgb, nucleus_mask, NUCLEUS_COLOR),
             draw_instance_mask(original_rgb, sam_clear, SAM_CLEAR_COLOR),
             draw_instance_mask(original_rgb, compact_candidate, CELLSEG_COMPACT_COLOR),
             draw_instance_mask(original_rgb, hybrid_mask, HYBRID_COLOR),
@@ -729,12 +796,11 @@ def main() -> None:
         titles = [
             f"{tile_key}: original",
             f"GT all n={int(gt_all.max())}",
-            f"YOLO nucleus n={int(nucleus_mask.max())}",
             f"SAM3 clear n={int(sam_clear.max())}",
             f"CellSeg1 residual compact n={int(compact_candidate.max())}",
             f"Hybrid n={int(hybrid_mask.max())}",
         ]
-        fig, axes = plt.subplots(1, 6, figsize=(30, 5))
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
         for ax, panel, title in zip(axes, panels, titles):
             ax.imshow(panel)
             ax.set_title(title)
@@ -766,6 +832,9 @@ def main() -> None:
         recall_mean=("recall_sensitivity", "mean"),
         pred_instances_mean=("pred_instances", "mean"),
         gt_instances_mean=("gt_instances", "mean"),
+        sam31_clear_instances_mean=("sam31_clear_instances", "mean"),
+        cellseg1_residual_compact_instances_mean=("cellseg1_residual_compact_instances", "mean"),
+        hybrid_instances_mean=("hybrid_instances", "mean"),
         inference_time_sec_mean=("inference_time_sec", "mean"),
     ).reset_index()
     summary_df.to_csv(summary_csv, index=False)
