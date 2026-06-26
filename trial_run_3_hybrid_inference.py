@@ -81,7 +81,12 @@ YOLO_MODEL_PATH = Path(
     )
 ).expanduser()
 
-TRIAL3_NAME = os.getenv("TRIAL3_NAME", "trial_run_3_hybrid_selected_tiles")
+TRIAL3_TILE_KEYS_RAW = os.getenv("TRIAL3_TILE_KEYS", "ALL").strip()
+PROCESS_ALL_TILES = TRIAL3_TILE_KEYS_RAW.upper() in {"", "*", "ALL"}
+TRIAL3_NAME = os.getenv(
+    "TRIAL3_NAME",
+    "trial_run_3_hybrid_all_tiles" if PROCESS_ALL_TILES else "trial_run_3_hybrid_selected_tiles",
+)
 OUT_DIR = Path(os.getenv("TRIAL3_OUT_DIR", str(SAM31_OUTPUT_ROOT / TRIAL3_NAME))).expanduser()
 PRED_MASK_DIR = OUT_DIR / "pred_masks"
 COMPARE_DIR = OUT_DIR / "comparison_images"
@@ -89,12 +94,10 @@ COMPARE_DIR = OUT_DIR / "comparison_images"
 SPLITS = [token.strip() for token in os.getenv("TRIAL3_SPLITS", "train,test").split(",") if token.strip()]
 TRIAL3_TILE_KEYS = [
     token.strip()
-    for token in os.getenv(
-        "TRIAL3_TILE_KEYS",
-        "train_human_compact_tile_001,train_human_compact_tile_002,train_human_compact_tile_003,train_human_compact_tile_004",
-    ).split(",")
+    for token in TRIAL3_TILE_KEYS_RAW.split(",")
     if token.strip()
 ]
+TRIAL3_MAX_IMAGES = int(os.getenv("TRIAL3_MAX_IMAGES", "0"))
 
 SAM31_CLEAR_PROMPTS = [
     token.strip()
@@ -158,6 +161,10 @@ def load_coco() -> Tuple[Dict[Tuple[str, int], str], Dict[Tuple[str, int], List[
 
 
 def select_images(image_infos: Sequence[dict]) -> List[dict]:
+    if PROCESS_ALL_TILES:
+        selected = list(image_infos)
+        return selected[:TRIAL3_MAX_IMAGES] if TRIAL3_MAX_IMAGES > 0 else selected
+
     wanted = set(TRIAL3_TILE_KEYS)
     selected = []
     for info in image_infos:
@@ -168,7 +175,7 @@ def select_images(image_infos: Sequence[dict]) -> List[dict]:
             selected.append(info)
     if not selected:
         raise RuntimeError(f"No selected trial tiles found: {TRIAL3_TILE_KEYS}")
-    return selected
+    return selected[:TRIAL3_MAX_IMAGES] if TRIAL3_MAX_IMAGES > 0 else selected
 
 
 def decode_coco_segmentation(segmentation, height: int, width: int) -> np.ndarray:
@@ -614,6 +621,109 @@ def combine_clear_and_compact(sam_clear: np.ndarray, compact_candidate: np.ndarr
     return final, class_mask, rows
 
 
+def mask_bbox(mask_bool: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask_bool)
+    if len(xs) == 0:
+        return 0, 0, 0, 0
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+
+
+def mask_perimeter(mask_bool: np.ndarray) -> float:
+    contours, _ = cv2.findContours(mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return float(sum(cv2.arcLength(contour, True) for contour in contours))
+
+
+def assign_nuclei_to_cell(cell_bool: np.ndarray, nucleus_mask: np.ndarray) -> Tuple[List[int], int, int, int]:
+    assigned_labels = []
+    overlap_area = 0
+    full_area = 0
+    centroid_hits = 0
+
+    for nuc_label in sorted(int(v) for v in np.unique(nucleus_mask) if int(v) != 0):
+        nucleus = nucleus_mask == nuc_label
+        overlap_px = int((cell_bool & nucleus).sum())
+        centroid = centroid_of_mask(nucleus)
+        centroid_inside = False
+        if centroid is not None:
+            x, y = centroid
+            centroid_inside = 0 <= y < cell_bool.shape[0] and 0 <= x < cell_bool.shape[1] and bool(cell_bool[y, x])
+        if overlap_px >= CELLSEG1_NUCLEUS_OVERLAP_PX or centroid_inside:
+            assigned_labels.append(nuc_label)
+            overlap_area += overlap_px
+            full_area += int(nucleus.sum())
+            centroid_hits += int(centroid_inside)
+
+    return assigned_labels, overlap_area, full_area, centroid_hits
+
+
+def extract_morphology_rows(
+    hybrid_mask: np.ndarray,
+    hybrid_class_mask: np.ndarray,
+    nucleus_mask: np.ndarray,
+    final_rows: List[dict],
+    split: str,
+    tile_id: str,
+    file_name: str,
+) -> List[dict]:
+    source_by_final_label = {int(row["final_label"]): row for row in final_rows}
+    rows = []
+
+    for final_label in sorted(int(v) for v in np.unique(hybrid_mask) if int(v) != 0):
+        cell = hybrid_mask == final_label
+        cell_area = int(cell.sum())
+        if cell_area == 0:
+            continue
+
+        source = source_by_final_label.get(final_label, {})
+        class_ids = hybrid_class_mask[cell]
+        final_class_id = int(np.bincount(class_ids.astype(np.int64)).argmax()) if class_ids.size else 0
+        final_class_name = source.get(
+            "final_class_name",
+            "clear_cell_boundary" if final_class_id == 1 else "compact_cell_boundary" if final_class_id == 2 else "unknown",
+        )
+        nucleus_labels, nucleus_area, nucleus_full_area, centroid_hits = assign_nuclei_to_cell(cell, nucleus_mask)
+        cytoplasm_area = max(cell_area - nucleus_area, 0)
+        centroid = centroid_of_mask(cell)
+        bbox_x, bbox_y, bbox_w, bbox_h = mask_bbox(cell)
+        perimeter = mask_perimeter(cell)
+
+        rows.append(
+            {
+                "trial": TRIAL3_NAME,
+                "split": split,
+                "tile_id": tile_id,
+                "file_name": file_name,
+                "final_label": final_label,
+                "final_class_id": final_class_id,
+                "final_class_name": final_class_name,
+                "source_model": source.get("source_model", "unknown"),
+                "source_label": source.get("source_label", np.nan),
+                "cell_area_px": cell_area,
+                "cell_perimeter_px": perimeter,
+                "cell_equiv_diameter_px": float(np.sqrt(4 * cell_area / np.pi)),
+                "cell_centroid_x": centroid[0] if centroid else np.nan,
+                "cell_centroid_y": centroid[1] if centroid else np.nan,
+                "cell_bbox_x": bbox_x,
+                "cell_bbox_y": bbox_y,
+                "cell_bbox_w": bbox_w,
+                "cell_bbox_h": bbox_h,
+                "nucleus_count": len(nucleus_labels),
+                "nucleus_labels": ";".join(str(label) for label in nucleus_labels),
+                "nucleus_area_px": nucleus_area,
+                "nucleus_full_area_px": nucleus_full_area,
+                "nucleus_centroid_hits": centroid_hits,
+                "nucleus_equiv_diameter_px": float(np.sqrt(4 * nucleus_area / np.pi)) if nucleus_area > 0 else np.nan,
+                "cytoplasm_area_px": cytoplasm_area,
+                "nc_ratio": nucleus_area / (cell_area + 1e-8),
+                "cytoplasm_to_nucleus_ratio": cytoplasm_area / nucleus_area if nucleus_area > 0 else np.nan,
+            }
+        )
+
+    return rows
+
+
 def load_sam3_processor():
     if str(SAM3_REPO) not in sys.path:
         sys.path.insert(0, str(SAM3_REPO))
@@ -696,6 +806,7 @@ def main() -> None:
     metrics_rows: List[dict] = []
     source_instance_rows: List[dict] = []
     final_instance_rows: List[dict] = []
+    morphology_rows: List[dict] = []
     saved_images: List[Path] = []
 
     for image_info in trial_images:
@@ -733,6 +844,17 @@ def main() -> None:
         )
         hybrid_mask, hybrid_class_mask, final_rows = combine_clear_and_compact(sam_clear, compact_candidate)
         elapsed = time.time() - started
+        morphology_rows.extend(
+            extract_morphology_rows(
+                hybrid_mask,
+                hybrid_class_mask,
+                nucleus_mask,
+                final_rows,
+                split,
+                tile_id,
+                image_info["file_name"],
+            )
+        )
 
         paths = {
             "hybrid": PRED_MASK_DIR / f"{tile_key}_hybrid_instance_mask.png",
@@ -818,10 +940,13 @@ def main() -> None:
     source_csv = OUT_DIR / "trial_run_3_source_instances.csv"
     final_csv = OUT_DIR / "trial_run_3_final_instances.csv"
     summary_csv = OUT_DIR / "trial_run_3_summary.csv"
+    morphology_csv = OUT_DIR / "trial_run_3_morphology_features.csv"
+    morphology_summary_csv = OUT_DIR / "trial_run_3_morphology_summary.csv"
 
     metrics_df.to_csv(metrics_csv, index=False)
     save_csv(source_csv, source_instance_rows)
     save_csv(final_csv, final_instance_rows)
+    save_csv(morphology_csv, morphology_rows)
 
     summary_df = metrics_df.groupby("model").agg(
         n_tiles=("tile_id", "count"),
@@ -839,14 +964,37 @@ def main() -> None:
     ).reset_index()
     summary_df.to_csv(summary_csv, index=False)
 
+    if morphology_rows:
+        morphology_df = pd.DataFrame(morphology_rows)
+        morphology_summary_df = morphology_df.groupby(["split", "final_class_name", "source_model"]).agg(
+            n_cells=("final_label", "count"),
+            cell_area_px_mean=("cell_area_px", "mean"),
+            cell_area_px_std=("cell_area_px", "std"),
+            nucleus_area_px_mean=("nucleus_area_px", "mean"),
+            cytoplasm_area_px_mean=("cytoplasm_area_px", "mean"),
+            nc_ratio_mean=("nc_ratio", "mean"),
+            nc_ratio_std=("nc_ratio", "std"),
+            nucleus_count_mean=("nucleus_count", "mean"),
+            cell_equiv_diameter_px_mean=("cell_equiv_diameter_px", "mean"),
+            nucleus_equiv_diameter_px_mean=("nucleus_equiv_diameter_px", "mean"),
+        ).reset_index()
+        morphology_summary_df.to_csv(morphology_summary_csv, index=False)
+    else:
+        morphology_summary_df = pd.DataFrame()
+        save_csv(morphology_summary_csv, [])
+
     print("\nTrial run 3 complete.")
     print("Output:", OUT_DIR)
     print("Metrics:", metrics_csv)
     print("Summary:", summary_csv)
     print("Source instances:", source_csv)
     print("Final instances:", final_csv)
+    print("Morphology features:", morphology_csv)
+    print("Morphology summary:", morphology_summary_csv)
     print("Comparison images:", COMPARE_DIR)
     print(summary_df)
+    if not morphology_summary_df.empty:
+        print(morphology_summary_df)
 
 
 if __name__ == "__main__":

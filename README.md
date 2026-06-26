@@ -192,7 +192,8 @@ folder exists.
 
 ## Trial Run 3: Hybrid YOLO + SAM3 + CellSeg1
 
-Trial run 3 measures a selected-tile hybrid inference pass:
+Trial run 3 measures the hybrid inference pass across all staged train/test
+tiles by default:
 
 - YOLO predicts nuclei.
 - SAM3 predicts clear-cell boundary candidates.
@@ -217,7 +218,7 @@ git switch codex/train-sam31-full41
 git pull --ff-only origin codex/train-sam31-full41
 ```
 
-Run the selected compact-tile trial:
+Run the all-tile trial:
 
 ```bash
 export SAM3_REPO="$HOME/Desktop/sam31-cgh-training-data/sam3"
@@ -225,17 +226,25 @@ export SAM31_OUTPUT_ROOT="$HOME/Desktop/sam31-cgh-strategy2/outputs/strategy2_41
 export YOLO_MODEL_PATH="$HOME/Desktop/sam31-cgh-training-data/training_data/reference_models/cellseg1_cgh_p2_yolo_best.pt"
 export CELLSEG1_REPO="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_repo"
 export CELLSEG1_RUN_DIR="$HOME/Desktop/1.Data/training_pa_he_annotation_full/outputs/cellseg1_cluster_live/cellseg1_cgh_p2_41full_20260625_124306"
-export TRIAL3_TILE_KEYS="train_human_compact_tile_001,train_human_compact_tile_002,train_human_compact_tile_003,train_human_compact_tile_004"
+export TRIAL3_TILE_KEYS=ALL
 export TRIAL3_CELLSEG1_NUCLEUS_DILATION_PX=8
 export TRIAL3_SAM31_NMS_IOU_THRESH=0.80
 
 python trial_run_3_hybrid_inference.py
 ```
 
+For a quick debug run, keep the all-tile output structure but cap the number of
+tiles:
+
+```bash
+export TRIAL3_MAX_IMAGES=4
+python trial_run_3_hybrid_inference.py
+```
+
 Outputs are written under:
 
 ```text
-outputs/strategy2_41tiles_full_unfreeze_20260625_160623/trial_run_3_hybrid_selected_tiles/
+outputs/strategy2_41tiles_full_unfreeze_20260625_160623/trial_run_3_hybrid_all_tiles/
 ```
 
 Key files:
@@ -245,6 +254,8 @@ trial_run_3_metrics.csv
 trial_run_3_summary.csv
 trial_run_3_source_instances.csv
 trial_run_3_final_instances.csv
+trial_run_3_morphology_features.csv
+trial_run_3_morphology_summary.csv
 comparison_images/*_trial3_compare.png
 pred_masks/*_hybrid_instance_mask.png
 ```
